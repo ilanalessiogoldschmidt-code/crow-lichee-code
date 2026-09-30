@@ -1,0 +1,12 @@
+build/
+*.o
+*.d
+*.h265
+*.h264
+*.yuv
+*.raw
+.DS_Store
+vendor/venc/sample_venc
+vendor/venc/sample_vcodec
+*.mp4
+*.png

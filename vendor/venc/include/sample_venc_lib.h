@@ -22,6 +22,8 @@ typedef struct _sampleVenc_ {
 } sampleVenc;
 
 CVI_S32 venc_main(int argc, char **argv);
+void crow_request_stop(void);
+void crow_wake_encoder_stop(void);
 CVI_S32 SAMPLE_VENC_INIT_CFG(sampleVenc *psv, int argc, char **argv);
 CVI_VOID initInputCfg(commonInputCfg *pcic, chnInputCfg *pIc);
 CVI_S32 parseEncArgv(sampleVenc *psv, chnInputCfg *pIc, CVI_S32 argc, char **argv);

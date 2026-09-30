@@ -21,15 +21,80 @@
 #include <linux/vi_tun_cfg.h>
 #include <sys/ioctl.h>
 
-static sampleVenc *g_crow_venc = NULL;
+/*
+ * Crow v0.6 stop + segmentation state (encoder path carried forward from validated v0.4).
+ *
+ * Signal ownership lives in Crow's main.c. Vendor/VENC threads do not install
+ * signal handlers; Crow converts Ctrl+C into this ordinary stop request.
+ */
+static volatile sig_atomic_t g_crow_stop_requested = 0;
+static volatile sig_atomic_t g_crow_venc_started = 0;
 
-static void crow_signal_handler(int signo)
+#define CROW_SEGMENT_FRAMES 50
+#define CROW_SEGMENT_PATH_MAX 255
+
+static CVI_U32 g_crow_segment_index = 0;
+
+static CVI_S32 crow_rotate_segment(vencChnCtx *pvecc)
 {
-        (void)signo;
+	chnInputCfg *pIc = &pvecc->chnIc;
+	char next_path[CROW_SEGMENT_PATH_MAX];
+	CVI_S32 ret;
 
-        if (g_crow_venc != NULL) {
-                SAMPLE_VENC_MOVE_TO_STOP_STATE(g_crow_venc);
-        }
+	if (pvecc->pFile) {
+		fflush(pvecc->pFile);
+		fclose(pvecc->pFile);
+		pvecc->pFile = NULL;
+	}
+
+	g_crow_segment_index++;
+
+	snprintf(next_path, sizeof(next_path),
+			"/root/crow_segments/segment_%06u.h265",
+			g_crow_segment_index);
+
+	snprintf(pIc->outputFileName, sizeof(pIc->outputFileName), "%s", next_path);
+
+	pvecc->pFile = fopen(pIc->outputFileName, "wb");
+	if (!pvecc->pFile) {
+		CVI_VENC_ERR("Crow: could not open segment %s\n",
+				pIc->outputFileName);
+		return CVI_FAILURE;
+	}
+
+	/*
+	 * The encoder is configured with a 50-frame GOP, matching the
+	 * two-second segment at 25 fps. Request an IDR as an extra guard so
+	 * the next segment begins at a random-access point.
+	 */
+	ret = CVI_VENC_RequestIDR(pvecc->VencChn, CVI_TRUE);
+	if (ret != CVI_SUCCESS) {
+		CVI_VENC_WARN("Crow: CVI_VENC_RequestIDR returned %#x\n", ret);
+	}
+
+	CVI_VENC_INFO("Crow: opened segment %06u -> %s\n",
+			g_crow_segment_index, pIc->outputFileName);
+
+	return CVI_SUCCESS;
+}
+
+void crow_request_stop(void)
+{
+	/*
+	 * Keep the control-thread stop request non-blocking.  In earlier Crow
+	 * builds CVI_VENC_StopRecvFrame() occasionally blocked here, which froze
+	 * the entire Ctrl+C path.  The main program now issues the wake from a
+	 * helper thread and enforces a shutdown watchdog.
+	 */
+	g_crow_stop_requested = 1;
+}
+
+void crow_wake_encoder_stop(void)
+{
+	if (g_crow_venc_started) {
+		CVI_S32 ret = CVI_VENC_StopRecvFrame(0);
+		CVI_VENC_INFO("Crow stop wake: CVI_VENC_StopRecvFrame(0) = %#x\n", ret);
+	}
 }
 
 #define MAX_VENC_OPTIONS	128
@@ -641,10 +706,11 @@ CVI_S32 venc_main(int argc, char **argv)
 		CVI_VENC_ERR("SAMPLE_VENC_INIT_CFG\n");
 		return s32Ret;
 	}
-	g_crow_venc = psv;
-	signal(SIGINT, crow_signal_handler);
-	signal(SIGTERM, crow_signal_handler);
 
+	/* Fresh Crow recording session. */
+	g_crow_stop_requested = 0;
+	g_crow_venc_started = 0;
+	g_crow_segment_index = 0;
 	if (pcic->testMode == JPEG_CONTI_ENCODE_MODE) {
 		int num_testcase = getNumTestcase(JPEG_CONTI_ENCODE_MODE);
 
@@ -2213,7 +2279,8 @@ static CVI_S32 _SAMPLE_VENC_initViVpss(sampleVenc *psv)
 				pIc->vpssGrp = vpssGrp;
 				pIc->vpssChn = s32ChnIdx;
 			}
-			sprintf(pIc->output_path, "test-%d", s32ChnIdx);
+			snprintf(pIc->output_path, sizeof(pIc->output_path),
+					"/root/crow_segments/segment_%06d", s32ChnIdx);
 		}
 	}
 
@@ -2280,6 +2347,8 @@ CVI_S32 SAMPLE_VENC_START(sampleVenc *psv)
 			for (CVI_S32 s32ChnIdx = 0; s32ChnIdx < pcic->numChn; s32ChnIdx++)
 				SAMPLE_VENC_StartGetStream(&psv->chnCtx[s32ChnIdx], s32ChnIdx);
 		}
+
+		g_crow_venc_started = 1;
 	} else {
 		CVI_VENC_ERR("codec = %s\n", pIc->codec);
 		return CVI_FAILURE;
@@ -2349,10 +2418,12 @@ CVI_S32 SAMPLE_VENC_STOP(sampleVenc *psv)
 				if (pcic->bThreadDisable == CVI_FALSE &&
 					gs_VencTask[s32ChnIdx] != 0) {
 
+						CVI_VENC_INFO("Crow: waiting for VENC worker %d...\n", s32ChnIdx);
 						pthread_join(
 								gs_VencTask[s32ChnIdx],
 								CVI_NULL
 						);
+						CVI_VENC_INFO("Crow: VENC worker %d exited.\n", s32ChnIdx);
 
 						gs_VencTask[s32ChnIdx] = 0;
 				}
@@ -2398,6 +2469,7 @@ CVI_S32 SAMPLE_VENC_STOP(sampleVenc *psv)
 		return -1;
 	}
 
+	g_crow_venc_started = 0;
 	return 0;
 }
 
@@ -2991,7 +3063,10 @@ static CVI_VOID *SAMPLE_VENC_GetVencStreamProc(CVI_VOID *pArgs)
 	}
 
 	i = 0;
-	while (pvecc->chnStat == CHN_STAT_START && pvecc->pFile && i < pvecc->num_frames) {
+	while (!g_crow_stop_requested &&
+	       pvecc->chnStat == CHN_STAT_START &&
+	       pvecc->pFile &&
+	       i < pvecc->num_frames) {
 		if (pIc->bind_mode == VENC_BIND_DISABLE) {
 			s32Ret = _getNonBindModeSrcFrame(pvecc, pstFrameInfo);
 			if (s32Ret != CVI_SUCCESS) {
@@ -3017,8 +3092,25 @@ static CVI_VOID *SAMPLE_VENC_GetVencStreamProc(CVI_VOID *pArgs)
 		usleep(100);
 
 		i++;
+
+		/*
+		 * Rotate every 50 encoded frames. At 25 fps this is about two
+		 * seconds. Rotation happens after the completed frame so each
+		 * finished segment contains exactly 50 stream pulls.
+		 */
+		if (!g_crow_stop_requested &&
+		    (i % CROW_SEGMENT_FRAMES) == 0 &&
+		    i < pvecc->num_frames) {
+			s32Ret = crow_rotate_segment(pvecc);
+			if (s32Ret != CVI_SUCCESS) {
+				CVI_VENC_ERR("Crow: segment rotation failed at frame %u\n", i);
+				break;
+			}
+		}
 	}
 
+	CVI_VENC_INFO("Crow: stream worker loop ended (stop=%d, frame=%u).\n",
+			g_crow_stop_requested ? 1 : 0, i);
 	CVI_VENC_FLOW("venc task%d end\n", pvecc->VencChn);
 
 	if (pvecc->s32VencFd >= 0) {
